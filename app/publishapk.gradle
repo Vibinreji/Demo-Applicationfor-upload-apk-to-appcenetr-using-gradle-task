@@ -1,0 +1,140 @@
+import groovy.json.JsonSlurper
+
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import java.text.SimpleDateFormat
+
+android.applicationVariants.all { variant ->
+    task("publish${variant.name.capitalize()}ToAppcenter", dependsOn: "assemble${variant.name.capitalize()}"){
+        group = "publishing"
+        description = "Genereate ${variant.name.capitalize()} APK and publish to S# "
+        doLast {
+            def ownerName = "******"
+            def appName = "******"
+            def apiToken = "************************************"
+            def releaseFileLocation = "/build/outputs/apk/debug/app-debug.apk"
+            def fileName = "${variant.name.capitalize()}/"+".apk"
+            def apkfile = variant.outputs[0].outputFile
+            def fileSizeBytes = apkfile.length()
+            def filePath = apkfile.getAbsolutePath()
+
+            def appType = "application/vnd.android.package-archive"
+            def UPLOAD_DOMAIN="https://file.appcenter.ms/upload"
+            def APPCENTER_OUTPUT_DIRECTORY="."
+
+            def metadataUrl = "https://api.appcenter.ms/v0.1/apps/$ownerName/$appName/uploads/releases"
+
+            def metadataParams = [:]
+            metadataParams.file_name = fileName
+            metadataParams.file_size = fileSizeBytes
+            metadataParams.content_type = appType
+
+            def metadataJson = new groovy.json.JsonBuilder(metadataParams).toString()
+            //commandLine "sh", "-c", "script: \"curl -s -d '${metadataJson}' -H 'Content-Type: application/json' -H 'X-API-Token: ${apiToken}' -H 'Accept: application/json' ${metadataUrl}\",\n" + "returnStdout: true"
+            def output = ""
+            def packageAssetId = ""
+            def stdout = new ByteArrayOutputStream()
+            def exitValue = 0
+            exec {
+                executable 'curl' args "${metadataUrl}", '-X', 'POST', '-H', 'Content-Length: 0','-H', 'Content-Type: application/json','-H', 'Accept: application/json', '-H', "X-API-Token:${apiToken}"
+                standardOutput = stdout;
+            }
+            def parsedJson = new groovy.json.JsonSlurper().parseText(stdout.toString())
+            packageAssetId = parsedJson.package_asset_id
+            def id = parsedJson.id
+
+            def urlEncodedToken =parsedJson.url_encoded_token
+            println "Output:\n$stdout";
+
+            println "Output:\n$filePath";
+
+
+
+            def uploadUrl = "https://api.appcenter.ms/v0.1/apps/${ownerName}/${appName}/uploads/releases/${packageAssetId}/packages/${fileName}?token=${urlEncodedToken}"
+            def metadata_url="$UPLOAD_DOMAIN/set_metadata/$packageAssetId?file_name=$fileName&file_size=$fileSizeBytes&token=$urlEncodedToken&content_type=$appType"
+
+            //sh "curl -X PUT -H 'Content-Type: ${appType}' -H 'X-API-Token: ${apiToken}' --data-binary @${releaseFileLocation} ${uploadUrl}"
+            //commandLine "sh", "-c", "curl -X PUT -H 'Content-Type: ${appType}' -H 'X-API-Token: ${apiToken}' --data-binary @${apkfile.getAbsolutePath()} ${uploadUrl}"
+            def uploadOut = new ByteArrayOutputStream()
+
+            exec {
+                executable 'curl' args "${metadata_url}",'-s','-d' , 'POST', '-H', 'Content-Length: 0','-H', 'Content-Type: application/json','-H', 'Accept: application/json', '-H', "X-API-Token:${apiToken}"
+                standardOutput = uploadOut;
+            }
+            def parsedUploadJson = new groovy.json.JsonSlurper().parseText(uploadOut.toString())
+            def chunkSize = parsedUploadJson.chunk_size
+            println "Actual APK size :\n$fileSizeBytes";
+
+            println "Output Upload:\n$uploadOut";
+
+
+            def splitDir = new File("$buildDir/split-dir") // Use buildDir to create the split directory inside the build directory
+            splitDir.mkdirs() // Create the split directory if it doesn't exist
+            exec {
+                executable 'split' args '-b', chunkSize, filePath, "$splitDir/split"
+            }
+            println "Total chunks created: ${splitDir.listFiles().size()}"
+
+            def blockNumber = 0
+            fileTree(splitDir).visit { FileVisitDetails details ->
+                if (details.file.isFile()) {
+                    println "\nuploading file $details.file.name"
+                    println "\nuploading file size  ${details.file.size()}"
+
+                    blockNumber++
+                    def contentLength = details.file.size()
+                    def uploadChunkUrl = "https://file.appcenter.ms/upload/upload_chunk/$packageAssetId?token=$urlEncodedToken&block_number=$blockNumber"
+                    exec {
+                        executable 'curl' args '-X', 'POST', uploadChunkUrl, '--data-binary', "@${details.file}", '-H', "Content-Length: $contentLength", '-H', "Content-Type: $appType"
+                    }
+                }
+            }
+
+            println "\nFile uploaded successfully"
+
+            def finishedUrl = "https://file.appcenter.ms/upload/finished/$packageAssetId?token=$urlEncodedToken"
+            exec {
+                executable 'curl' args '-d', 'POST', '-H', 'Content-Type: application/json', '-H', 'Accept: application/json', '-H', "X-API-Token: $apiToken", finishedUrl
+            }
+
+            def commitUrl = "https://api.appcenter.ms/v0.1/apps/$ownerName/$appName/uploads/releases/$id"
+            exec {
+                executable 'curl' args '-H', 'Content-Type: application/json', '-H', 'Accept: application/json', '-H', "X-API-Token: $apiToken", '--data', "{\"upload_status\": \"uploadFinished\",\"id\": \"$id\"}", '-X', 'PATCH', commitUrl
+            }
+
+            println "File uploaded finished successfully"
+
+            def releaseStatusUrl = "https://api.appcenter.ms/v0.1/apps/$ownerName/$appName/uploads/releases/$id"
+            def counter = 0
+            def max_poll_attempts = 15
+            def releaseId = null
+
+            while (releaseId == null && (counter < max_poll_attempts)) {
+                def pollResult = new ByteArrayOutputStream()
+
+                exec {
+                    executable 'curl' args '-s', '-H', 'Content-Type: application/json', '-H', 'Accept: application/json', '-H', "X-API-Token: $apiToken", releaseStatusUrl
+                    standardOutput = pollResult
+                }
+                def pollresltString = new groovy.json.JsonSlurper().parseText(pollResult.toString())
+                println "pollresltString:\n$pollresltString";
+
+                releaseId = pollresltString.release_distinct_id
+                println "$counter $releaseId"
+                counter += 1
+                Thread.sleep(3000)
+            }
+
+            if (releaseId == null) {
+                println "Failed to find release from App Center"
+                //System.exit(1)
+            }
+
+            def distributionGroup = "testTeam" // Replace with the actual distribution group name
+            def distributeUrl = "https://api.appcenter.ms/v0.1/apps/$ownerName/$appName/releases/$releaseId"
+            exec {
+                executable 'curl'args '-H', 'Content-Type: application/json', '-H', 'Accept: application/json', '-H', "X-API-Token: $apiToken", '-X', 'PATCH', distributeUrl, '--data', "{\"destinations\": [{\"name\": \"$distributionGroup\"}]}"
+            }
+        }
+    }
+}
